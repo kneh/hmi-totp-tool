@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>HMI fleet code</title>
+<style>
+  :root {
+    --bg: #15171a; --panel: #1f2225; --border: #333a3f; --accent: #3a9eff;
+    --text: #e8eaec; --dim: #9aa0a6; --ok: #3ddc84; --warn: #ffb020;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 13px; margin: 0 0 20px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 6px; text-transform: uppercase; letter-spacing: .04em; }
+  input[type=text], input[type=password] {
+    width: 100%; padding: 12px; font-size: 16px; border-radius: 8px;
+    border: 1px solid var(--border); background: #101214; color: var(--text);
+  }
+  .row { display: flex; gap: 10px; margin-top: 10px; }
+  button {
+    flex: 1; padding: 12px; font-size: 14px; font-weight: 600; border-radius: 8px;
+    border: 1px solid var(--border); background: #2a2e32; color: var(--text); cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:active { opacity: .8; }
+  button:disabled { opacity: .4; cursor: default; }
+  .code {
+    font-family: "SF Mono", Consolas, monospace; font-size: 56px; font-weight: 700;
+    letter-spacing: .08em; text-align: center; padding: 14px 0; color: var(--ok);
+  }
+  .code.stale { color: var(--dim); }
+  .bar { height: 5px; background: #101214; border-radius: 3px; overflow: hidden; margin-top: 4px; }
+  .bar > div { height: 100%; background: var(--accent); transition: width 1s linear; }
+  .hint { font-size: 12px; color: var(--dim); margin-top: 8px; }
+  .warn { font-size: 12px; color: var(--warn); margin-top: 10px; line-height: 1.5; }
+  video { width: 100%; border-radius: 8px; display: block; background: #000; }
+  #scanWrap { display: none; margin-top: 10px; }
+  #scanStatus { font-size: 12px; color: var(--dim); margin-top: 6px; text-align: center; }
+</style>
+</head>
+<body>
+<h1>HMI fleet service code</h1>
+<p class="sub">Computes the current one-time code for a specific HMI, from your master secret + that
+unit's device ID. Nothing here ever leaves this device -- no network calls, works fully offline once loaded.</p>
+
+<div class="card">
+  <label for="master">Master secret (entered once, saved only in this browser)</label>
+  <input id="master" type="password" autocomplete="off" placeholder="paste the secret you were given">
+  <div class="row">
+    <button id="saveMaster" class="primary">Save</button>
+    <button id="clearMaster">Clear &amp; forget</button>
+  </div>
+  <div class="hint" id="masterStatus">Not set.</div>
+</div>
+
+<div class="card">
+  <label for="device">Device ID (shown on the HMI's lock screen)</label>
+  <input id="device" type="text" autocomplete="off" placeholder="e.g. UN65-A1B2C3">
+  <div class="row">
+    <button id="scanBtn" class="primary">Scan QR</button>
+  </div>
+  <div id="scanWrap">
+    <video id="video" playsinline muted></video>
+    <div id="scanStatus">Point the camera at the HMI's QR code...</div>
+    <div class="row"><button id="stopScan">Cancel</button></div>
+  </div>
+</div>
+
+<div class="card">
+  <label>Current code</label>
+  <div class="code" id="code">------</div>
+  <div class="bar"><div id="barFill" style="width:100%"></div></div>
+  <div class="hint" id="codeHint">Set a master secret and a device ID above.</div>
+</div>
+
+<p class="warn">
+  This page is public (anyone can load it) -- that's fine, it's just a calculator. The thing that
+  actually protects every HMI is the master secret, which is never written into this page or sent
+  anywhere. Only share the secret itself out-of-band (in person, not chat/email) with people who should
+  have fleet-wide access, and never commit it to a repository, screenshot, or message log.
+</p>
+
+<script src="jsQR.min.js"></script>
+<script>
+"use strict";
+
+// ---- crypto: device_secret = HMAC-SHA256(master, device_id); TOTP(device_secret, SHA256, 6 digits, 30s) ----
+// Matches the panel's own verification code exactly (see docs in the exor-hmi-os repo) -- deliberately NOT
+// the same SHA1-based scheme a stock authenticator app uses, since this tool is paired with our own
+// per-device-derived verification on the panel side, not a generic TOTP account.
+const PERIOD = 30, DIGITS = 6;
+
+async function hmacSha256(keyBytes, msgBytes) {
+  const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, msgBytes);
+  return new Uint8Array(sig);
+}
+
+function u8(str) { return new TextEncoder().encode(str); }
+
+async function deriveDeviceSecret(masterStr, deviceIdStr) {
+  return hmacSha256(u8(masterStr), u8(deviceIdStr));
+}
+
+async function totpCode(secretBytes, unixSeconds) {
+  const counter = Math.floor(unixSeconds / PERIOD);
+  const counterBytes = new Uint8Array(8);
+  // big-endian 64-bit counter (top 4 bytes always 0 at realistic unix-time scales)
+  let hi = Math.floor(counter / 0x100000000), lo = counter >>> 0;
+  new DataView(counterBytes.buffer).setUint32(0, hi); new DataView(counterBytes.buffer).setUint32(4, lo);
+  const digest = await hmacSha256(secretBytes, counterBytes);
+  const offset = digest[digest.length - 1] & 0x0f;
+  const value = ((digest[offset] & 0x7f) << 24) | (digest[offset + 1] << 16) | (digest[offset + 2] << 8) | digest[offset + 3];
+  return String(value % 10 ** DIGITS).padStart(DIGITS, "0");
+}
+
+// ---- UI wiring ----
+const $ = (id) => document.getElementById(id);
+const MASTER_KEY = "hmi_totp_master";
+
+function loadMaster() { try { return localStorage.getItem(MASTER_KEY) || ""; } catch { return ""; } }
+function saveMaster(v) { try { localStorage.setItem(MASTER_KEY, v); } catch {} }
+function clearMaster() { try { localStorage.removeItem(MASTER_KEY); } catch {} }
+
+$("master").value = loadMaster();
+updateMasterStatus();
+
+function updateMasterStatus() {
+  $("masterStatus").textContent = $("master").value ? "Saved in this browser." : "Not set.";
+}
+
+$("saveMaster").onclick = () => { saveMaster($("master").value); updateMasterStatus(); refresh(); };
+$("clearMaster").onclick = () => { $("master").value = ""; clearMaster(); updateMasterStatus(); refresh(); };
+
+let refreshTimer = null;
+async function refresh() {
+  const master = $("master").value.trim();
+  const device = $("device").value.trim();
+  const now = Math.floor(Date.now() / 1000);
+  const secondsIntoStep = now % PERIOD;
+  const pct = 100 - Math.round((secondsIntoStep / PERIOD) * 100);
+  $("barFill").style.width = pct + "%";
+  if (!master || !device) {
+    $("code").textContent = "------"; $("code").className = "code stale";
+    $("codeHint").textContent = "Set a master secret and a device ID above.";
+    return;
+  }
+  try {
+    const secret = await deriveDeviceSecret(master, device);
+    const code = await totpCode(secret, now);
+    $("code").textContent = code.slice(0, 3) + " " + code.slice(3);
+    $("code").className = "code";
+    $("codeHint").textContent = `For device "${device}" -- refreshes every ${PERIOD}s.`;
+  } catch (e) {
+    $("code").textContent = "ERROR"; $("code").className = "code stale";
+    $("codeHint").textContent = String(e);
+  }
+}
+$("device").addEventListener("input", refresh);
+refresh();
+setInterval(refresh, 1000);
+
+// ---- QR scan (camera) ----
+let stream = null, scanRAF = null;
+const video = $("video"), canvas = document.createElement("canvas");
+const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+$("scanBtn").onclick = async () => {
+  $("scanWrap").style.display = "block";
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+    video.srcObject = stream; await video.play();
+    scanLoop();
+  } catch (e) {
+    $("scanStatus").textContent = "Camera unavailable (" + e.message + ") -- type the device ID instead.";
+  }
+};
+
+$("stopScan").onclick = stopScan;
+
+function stopScan() {
+  if (scanRAF) cancelAnimationFrame(scanRAF);
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null; scanRAF = null;
+  $("scanWrap").style.display = "none";
+}
+
+function scanLoop() {
+  if (!stream) return;
+  if (video.readyState === video.HAVE_ENOUGH_DATA) {
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const result = jsQR(img.data, img.width, img.height);
+    if (result && result.data) {
+      $("device").value = result.data.trim();
+      refresh();
+      stopScan();
+      return;
+    }
+  }
+  scanRAF = requestAnimationFrame(scanLoop);
+}
+</script>
+</body>
+</html>
