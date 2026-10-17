@@ -50,9 +50,15 @@
 <body>
 <h1>HMI fleet service code</h1>
 <p class="sub">Computes the current one-time code for a specific HMI, from your master secret + that
-unit's device ID. Nothing here ever leaves this device -- no network calls, works fully offline once loaded.</p>
+unit's device ID. The master secret itself never leaves this device -- it's only ever used locally.
+This page does check in online opportunistically (see the status line below) so access can be revoked
+fleet-wide; it still works offline for a limited grace period between check-ins.</p>
 
-<div class="card">
+<div class="card" id="statusCard">
+  <div class="hint" id="statusLine">Checking in...</div>
+</div>
+
+<div class="card" id="mainCard">
   <label for="master">Master secret (entered once, saved only in this browser)</label>
   <input id="master" type="password" autocomplete="off" placeholder="paste the secret you were given">
   <div class="row">
@@ -98,6 +104,8 @@ unit's device ID. Nothing here ever leaves this device -- no network calls, work
 // the same SHA1-based scheme a stock authenticator app uses, since this tool is paired with our own
 // per-device-derived verification on the panel side, not a generic TOTP account.
 const PERIOD = 30, DIGITS = 6;
+let locked = true, lockMessage = "";     // declared up top: refresh() checks it, and the first refresh()
+                                          // call below runs before the check-in block further down does
 
 async function hmacSha256(keyBytes, msgBytes) {
   const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -143,6 +151,11 @@ $("clearMaster").onclick = () => { $("master").value = ""; clearMaster(); update
 
 let refreshTimer = null;
 async function refresh() {
+  if (locked) {
+    $("code").textContent = "LOCKED"; $("code").className = "code stale";
+    $("codeHint").textContent = lockMessage || "Not checked in yet.";
+    return;
+  }
   const master = $("master").value.trim();
   const device = $("device").value.trim();
   const now = Math.floor(Date.now() / 1000);
@@ -168,6 +181,61 @@ async function refresh() {
 $("device").addEventListener("input", refresh);
 refresh();
 setInterval(refresh, 1000);
+
+// ---- opportunistic online check-in / revocation -------------------------------------------------------
+// status.json lives in this same repo -- editing it (ok:false, with a message) and pushing is how this tool
+// gets revoked fleet-wide. Ships usually do have intermittent internet, so this checks in on every load and
+// periodically while open; if it can't reach it, the LAST successful check-in's age is used instead (a
+// local clock comparison, so a deliberately-offline device is still bounded by the grace period from its
+// last real check-in -- going offline doesn't extend access, it just stops renewing the window).
+const GRACE_MS = 14 * 24 * 60 * 60 * 1000;          // 14 days
+const LAST_OK_KEY = "hmi_totp_last_ok";
+
+function setLocked(isLocked, message) {
+  locked = isLocked; lockMessage = message || "";
+  $("mainCard").style.display = locked ? "none" : "block";
+  refresh();
+}
+
+async function checkIn() {
+  try {
+    const res = await fetch("status.json?t=" + Date.now(), { cache: "no-store" });
+    if (!res.ok) throw new Error("http " + res.status);
+    const data = await res.json();
+    if (data.ok === false) {
+      $("statusLine").textContent = "Access revoked: " + (data.message || "contact the administrator.");
+      try { localStorage.removeItem(LAST_OK_KEY); } catch {}
+      setLocked(true, data.message || "Access revoked.");
+      return;
+    }
+    try { localStorage.setItem(LAST_OK_KEY, String(Date.now())); } catch {}
+    $("statusLine").textContent = "Checked in -- OK.";
+    setLocked(false);
+  } catch (e) {
+    let lastOk = 0;
+    try { lastOk = parseInt(localStorage.getItem(LAST_OK_KEY) || "0", 10); } catch {}
+    if (!lastOk) {
+      $("statusLine").textContent = "No internet, and this device has never checked in -- "
+        + "connect it to the internet once to activate it.";
+      setLocked(true, "Never checked in.");
+      return;
+    }
+    const ageMs = Date.now() - lastOk;
+    if (ageMs > GRACE_MS) {
+      const days = Math.floor(ageMs / 86400000);
+      $("statusLine").textContent = `No internet for ${days} days (grace period is 14) -- `
+        + "locked until it can check in again.";
+      setLocked(true, "Grace period expired.");
+      return;
+    }
+    const daysLeft = Math.ceil((GRACE_MS - ageMs) / 86400000);
+    $("statusLine").textContent = `Offline -- working on the last check-in, ${daysLeft} day(s) of grace left.`;
+    setLocked(false);
+  }
+}
+
+checkIn();
+setInterval(checkIn, 15 * 60 * 1000);           // re-check every 15 min while the page stays open
 
 // ---- QR scan (camera) ----
 let stream = null, scanRAF = null;
